@@ -1,0 +1,335 @@
+package com.nhattung.productservice.service.product;
+
+import com.nhattung.productservice.dto.ImageDto;
+import com.nhattung.productservice.dto.ProductDto;
+import com.nhattung.productservice.entity.Category;
+import com.nhattung.productservice.entity.Image;
+import com.nhattung.productservice.entity.Product;
+import com.nhattung.productservice.exception.AppException;
+import com.nhattung.productservice.exception.ErrorCode;
+import com.nhattung.productservice.repository.CategoryRepository;
+import com.nhattung.productservice.repository.ImageRepository;
+import com.nhattung.productservice.repository.ProductRepository;
+import com.nhattung.productservice.repository.httpclient.InventoryClient;
+import com.nhattung.productservice.request.CreateProductRequest;
+import com.nhattung.productservice.request.InventoryRequest;
+import com.nhattung.productservice.request.UpdateProductRequest;
+import com.nhattung.productservice.response.PageResponse;
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
+import io.github.resilience4j.retry.annotation.Retry;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.modelmapper.ModelMapper;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.CachePut;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.Optional;
+import java.util.function.Supplier;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class ProductService implements IProductService {
+
+    private final ProductRepository productRepository;
+    private final CategoryRepository categoryRepository;
+    private final ModelMapper modelMapper;
+    private final ImageRepository imageRepository;
+    private final InventoryClient inventoryClient;
+    private final RateLimiter inventoryServiceRateLimiter;
+    @Cacheable(value = "products", key = "#id")
+    @Override
+    public ProductDto getProductById(Long id) {
+        Product product = productRepository.findById(id)
+                .orElseThrow(() -> new AppException(ErrorCode.PRODUCT_NOT_FOUND));
+        return convertToDto(product);
+    }
+
+
+    @CachePut(value = "products", key = "#request.name")
+    @CacheEvict(value = "products", key = "'allProducts'")
+    @Override
+    public Product saveProduct(CreateProductRequest request) {
+        if (isProductExisted(request.getName(), request.getBrand())) {
+            throw new AppException(ErrorCode.PRODUCT_EXISTED);
+        }
+        Category category = Optional.ofNullable(categoryRepository.findByName(request.getCategoryName()))
+                .orElseGet(() -> {
+                    return categoryRepository.save(Category
+                            .builder()
+                            .name(request.getCategoryName())
+                            .build());
+                });
+
+
+        Product product = productRepository.save(createProduct(request, category));
+
+        InventoryRequest inventoryRequest = InventoryRequest.builder()
+                .productId(product.getId())
+                .quantity(request.getQuantity())
+                .build();
+        inventoryClient.addInventory(inventoryRequest);
+
+        return product;
+    }
+
+    private boolean isProductExisted(String name, String brand) {
+        return productRepository.existsByNameAndBrand(name, brand);
+    }
+    private Product createProduct(CreateProductRequest request, Category category) {
+        return Product.builder()
+                .name(request.getName())
+                .description(request.getDescription())
+                .brand(request.getBrand())
+                .costPrice(request.getCostPrice())
+                .sellingPrice(request.getSellingPrice())
+                .category(category)
+                .build();
+    }
+
+
+    @CachePut(value = "products", key = "#id")
+    @Override
+    public Product updateProduct(Long id, UpdateProductRequest request) {
+        return productRepository.findById(id)
+                .map((existingProduct -> updateExistingProduct(existingProduct, request)))
+                .map(productRepository::save)
+                .orElseThrow(() -> new AppException(ErrorCode.PRODUCT_NOT_FOUND));
+    }
+
+    private Product updateExistingProduct(Product existingProduct, UpdateProductRequest request){
+        existingProduct.setName(request.getName());
+        existingProduct.setDescription(request.getDescription());
+        existingProduct.setBrand(request.getBrand());
+        existingProduct.setCostPrice(request.getCostPrice());
+        existingProduct.setSellingPrice(request.getSellingPrice());
+        Category category = categoryRepository.findByName(request.getCategoryName());
+        if (category == null) {
+            throw new AppException(ErrorCode.CATEGORY_NOT_FOUND);
+        }
+        existingProduct.setCategory(category);
+
+        InventoryRequest inventoryRequest = InventoryRequest.builder()
+                .productId(existingProduct.getId())
+                .quantity(request.getQuantity())
+                .build();
+        inventoryClient.updateInventory(inventoryRequest);
+
+        return existingProduct;
+    }
+
+    @Caching(evict = {
+            @CacheEvict(value = "products", key = "#id"),
+            @CacheEvict(value = "products", key = "'allProducts'", beforeInvocation = true)
+    })
+    @Override
+    public void deleteProduct(Long id) {
+        productRepository.findById(id)
+                .ifPresentOrElse(productRepository::delete,() -> {
+                    throw new AppException(ErrorCode.PRODUCT_NOT_FOUND);
+                });
+        inventoryClient.deleteInventory(id);
+    }
+
+
+
+    @Override
+    public List<Product> getAllProducts() {
+        return productRepository.findAll();
+    }
+
+    @Cacheable(value = "products", key = "'allProducts'")
+    @Override
+    public PageResponse<ProductDto> getPagedProducts(int page, int size) {
+        if (page < 0 || size <= 0) {
+            throw new AppException(ErrorCode.INVALID_PAGE_SIZE);
+        }
+
+        Sort sort = Sort.by(Sort.Direction.DESC, "createdAt");
+        Pageable pageable = PageRequest.of(page-1,size, sort);
+
+        Page<Product> productPage = productRepository.findAll(pageable);
+        List<ProductDto> productDtos = getConvertedProducts(productPage.getContent());
+        return PageResponse.<ProductDto>builder()
+                .currentPage(page)
+                .totalPages(productPage.getTotalPages())
+                .totalElements(productPage.getTotalElements())
+                .pageSize(productPage.getSize())
+                .data(productDtos)
+                .build();
+    }
+
+    @Override
+    public List<Product> getProductsByCategory(String category) {
+        return productRepository.findByCategoryName(category);
+    }
+
+    @Override
+    public PageResponse<ProductDto> getPagedProductsByCategory(String category, int page, int size) {
+        if (page < 0 || size <= 0) {
+            throw new AppException(ErrorCode.INVALID_PAGE_SIZE);
+        }
+
+        Sort sort = Sort.by(Sort.Direction.DESC, "createdAt");
+        Pageable pageable = PageRequest.of(page-1,size, sort);
+
+        Page<Product> productPage = productRepository.findByCategoryName(category, pageable);
+        List<ProductDto> productDtos = getConvertedProducts(productPage.getContent());
+        return PageResponse.<ProductDto>builder()
+                .currentPage(page)
+                .totalPages(productPage.getTotalPages())
+                .totalElements(productPage.getTotalElements())
+                .pageSize(productPage.getSize())
+                .data(productDtos)
+                .build();
+    }
+
+    @Override
+    public List<Product> getProductsByBrand(String brand) {
+        return productRepository.findByBrand(brand);
+    }
+
+    @Override
+    public PageResponse<ProductDto> getPagedProductsByBrand(String brand, int page, int size) {
+        if (page < 0 || size <= 0) {
+            throw new AppException(ErrorCode.INVALID_PAGE_SIZE);
+        }
+
+        Sort sort = Sort.by(Sort.Direction.DESC, "createdAt");
+        Pageable pageable = PageRequest.of(page-1,size, sort);
+
+        Page<Product> productPage = productRepository.findByBrand(brand, pageable);
+        List<ProductDto> productDtos = getConvertedProducts(productPage.getContent());
+        return PageResponse.<ProductDto>builder()
+                .currentPage(page)
+                .totalPages(productPage.getTotalPages())
+                .totalElements(productPage.getTotalElements())
+                .pageSize(productPage.getSize())
+                .data(productDtos)
+                .build();
+    }
+
+    @Override
+    public List<Product> getProductsByCategoryAndBrand(String category, String brand) {
+        return productRepository.findByCategoryNameAndBrand(category, brand);
+    }
+
+    @Override
+    public PageResponse<ProductDto> getPagedProductsByCategoryAndBrand(
+            String category, String brand, int page, int size) {
+
+        if (page < 0 || size <= 0) {
+            throw new AppException(ErrorCode.INVALID_PAGE_SIZE);
+        }
+        Sort sort = Sort.by(Sort.Direction.DESC, "createdAt");
+        Pageable pageable = PageRequest.of(page-1,size, sort);
+        Page<Product> productPage = productRepository.findByCategoryNameAndBrand(category, brand, pageable);
+        List<ProductDto> productDtos = getConvertedProducts(productPage.getContent());
+        return PageResponse.<ProductDto>builder()
+                .currentPage(page)
+                .totalPages(productPage.getTotalPages())
+                .totalElements(productPage.getTotalElements())
+                .pageSize(productPage.getSize())
+                .data(productDtos)
+                .build();
+
+    }
+
+    @Override
+    public List<Product> getProductsByName(String name) {
+        return productRepository.findByName(name);
+    }
+
+    @Override
+    public PageResponse<ProductDto> getPagedProductsByName(String name, int page, int size) {
+        if (page < 0 || size <= 0) {
+            throw new AppException(ErrorCode.INVALID_PAGE_SIZE);
+        }
+        Sort sort = Sort.by(Sort.Direction.DESC, "createdAt");
+        Pageable pageable = PageRequest.of(page-1,size, sort);
+        Page<Product> productPage = productRepository.findByName(name, pageable);
+        List<ProductDto> productDtos = getConvertedProducts(productPage.getContent());
+        return PageResponse.<ProductDto>builder()
+                .currentPage(page)
+                .totalPages(productPage.getTotalPages())
+                .totalElements(productPage.getTotalElements())
+                .pageSize(productPage.getSize())
+                .data(productDtos)
+                .build();
+    }
+
+    @Override
+    public List<Product> getProductsByBrandAndName(String brand, String name) {
+        return productRepository.findByBrandAndName(brand, name);
+    }
+
+    @Override
+    public PageResponse<ProductDto> getPagedProductsByBrandAndName(String brand, String name, int page, int size) {
+        if (page < 0 || size <= 0) {
+            throw new AppException(ErrorCode.INVALID_PAGE_SIZE);
+        }
+        Sort sort = Sort.by(Sort.Direction.DESC, "createdAt");
+        Pageable pageable = PageRequest.of(page-1,size, sort);
+        Page<Product> productPage = productRepository.findByBrandAndName(brand, name, pageable);
+        List<ProductDto> productDtos = getConvertedProducts(productPage.getContent());
+        return PageResponse.<ProductDto>builder()
+                .currentPage(page)
+                .totalPages(productPage.getTotalPages())
+                .totalElements(productPage.getTotalElements())
+                .pageSize(productPage.getSize())
+                .data(productDtos)
+                .build();
+    }
+
+    @Override
+    public Long countProductsByBrandAndName(String brand, String name) {
+        return productRepository.countByBrandAndName(brand, name);
+    }
+
+    @Override
+    public List<ProductDto> getConvertedProducts(List<Product> products) {
+        return products.stream()
+                .map(this::convertToDto)
+                .toList();
+    }
+
+    @Override
+    public ProductDto convertToDto(Product product) {
+        ProductDto productDto = modelMapper.map(product, ProductDto.class);
+        List<Image> images = imageRepository.findByProductId(product.getId());
+        List<ImageDto> imageDtos = images.stream()
+                .map(image -> modelMapper.map(image, ImageDto.class))
+                .toList();
+        productDto.setImages(imageDtos);
+        int quantity = getInventory(product.getId());
+        productDto.setQuantity(quantity);
+        return productDto;
+    }
+
+    public int getInventory(Long productId) {
+        // Gói lời gọi InventoryService trong RateLimiter
+        Supplier<Integer> inventorySupplier = RateLimiter.decorateSupplier(
+                inventoryServiceRateLimiter,
+                () -> inventoryClient.getInventory(productId)
+        );
+
+        try {
+            // Thực thi lời gọi, nếu vượt giới hạn sẽ ném ra lỗi
+            return inventorySupplier.get();
+        } catch (RequestNotPermitted e) {
+            throw new AppException(ErrorCode.RATE_LIMIT_EXCEEDED);
+        }
+    }
+
+
+
+}

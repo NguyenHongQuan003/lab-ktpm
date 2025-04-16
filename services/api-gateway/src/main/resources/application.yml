@@ -1,0 +1,18 @@
+spring:
+  config:
+    import: optional:configserver:http://localhost:8888
+  cloud:
+    config:
+      fail-fast: true
+  application:
+    name: api-gateway
+
+
+
+idp:
+  url: http://localhost:8081/realms/springboot-ms-realm/protocol/openid-connect
+  client-id: ecommerce_ms_app
+  client-secret: B9HnviniWRfOQEKzEhLROtl3USI13Irl
+
+app:
+  apiPrefix: /api/v1
