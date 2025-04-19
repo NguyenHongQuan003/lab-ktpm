@@ -6,13 +6,16 @@ const PORT = 4000;
 let count = 0;
 
 app.get('/api', (req, res) => {
-    count++;
-    if (count % 5 === 0 || count == 6) {
-        res.status(500).send('Lỗi backend!');
-    } else {
-        res.json({ message: 'Service OK', time: new Date() });
-    }
+    setTimeout(() => {
+        count++;
+        if (count % 5 === 0) {
+            res.status(500).send('Lỗi backend!');
+        } else {
+            res.json({ message: 'Service OK', time: new Date() });
+        }
+    }, 0); // delay 3 giây
 });
+
 
 app.listen(PORT, () => {
     console.log(`Backend server chạy tại http://localhost:${PORT}/api`);

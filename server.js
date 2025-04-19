@@ -15,7 +15,7 @@ async function callBackendService() {
 // Tạo circuit breaker
 const breaker = new CircuitBreaker(callBackendService, {
     timeout: 3000,
-    errorThresholdPercentage: 20,     // mở mạch khi >20% lỗi
+    errorThresholdPercentage: 20,
     resetTimeout: 10000,
     rollingCountBuckets: 5,
     rollingCountTimeout: 10000
